@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git config:*)",
+      "Bash(powershell:*)",
+      "Bash(powershell.exe:*)",
+      "Bash(pwsh:*)",
+      "Bash(ls:*)",
+      "Bash(dir:*)",
+      "Bash(tree:*)",
+      "Bash(cat:*)",
+      "Bash(type:*)",
+      "Bash(findstr:*)",
+      "Bash(gh:*)",
+      "Bash(gh release create:*)",
+      "Bash(tasklist:*)",
+      "Bash(taskkill:*)",
+      "desktop-commander/list_directory",
+      "desktop-commander/read_file",
+      "desktop-commander/read_multiple_files",
+      "Bash(powershell -Command:*)",
+      "Bash(powershell -NoProfile -Command \"& { $errors = $null; $null = [System.Management.Automation.Language.Parser]::ParseFile\\(\\(Resolve-Path ''Tests\\\\Portable.Tests.ps1''\\).Path, [ref]$null, [ref]$errors\\); if \\($errors.Count -gt 0\\) { $errors | ForEach-Object { Write-Host $_Message }; exit 1 } else { Write-Host ''Portable.Tests.ps1: Syntax OK'' } }\")",
+      "Bash(git init:*)"
+    ],
+    "deny": []
+  },
+  "hooks": {}
+}

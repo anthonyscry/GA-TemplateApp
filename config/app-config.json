@@ -1,0 +1,24 @@
+{
+  "application": {
+    "name": "GA-TemplateApp",
+    "version": "1.0.0",
+    "author": "[Your Name]",
+    "organization": "General Atomics"
+  },
+  "settings": {
+    "darkMode": true,
+    "autoSave": false,
+    "notifications": true,
+    "logLevel": "Info"
+  },
+  "paths": {
+    "logs": ".\\logs",
+    "config": ".\\config",
+    "output": ".\\output"
+  },
+  "features": {
+    "feature1Enabled": true,
+    "feature2Enabled": true,
+    "feature3Enabled": false
+  }
+}

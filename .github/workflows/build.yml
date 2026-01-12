@@ -1,0 +1,472 @@
+# GA-TemplateApp CI/CD Pipeline
+# Standardized workflow for GA PowerShell applications
+
+name: Build and Test
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number (e.g., 1.0.0)'
+        required: false
+        default: ''
+      skip_tests:
+        description: 'Skip test execution'
+        type: boolean
+        default: false
+      create_release:
+        description: 'Create GitHub release'
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ============================================
+  # Job 1: Code Review (PSScriptAnalyzer)
+  # ============================================
+  code-review:
+    name: Code Review
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+
+      - name: Run PSScriptAnalyzer - Code Quality
+        id: lint
+        shell: pwsh
+        run: |
+          $results = @()
+          $files = Get-ChildItem -Path . -Include '*.ps1', '*.psm1', '*.psd1' -Recurse |
+            Where-Object { $_.FullName -notmatch '[\\/](\.git|Tests|node_modules)[\\/]' }
+
+          Write-Host "Analyzing $($files.Count) PowerShell files..."
+
+          foreach ($file in $files) {
+            $analysis = Invoke-ScriptAnalyzer -Path $file.FullName -Severity Error, Warning `
+              -ExcludeRule @(
+                'PSAvoidUsingWriteHost',
+                'PSUseShouldProcessForStateChangingFunctions',
+                'PSAvoidUsingInvokeExpression'
+              )
+            if ($analysis) {
+              $results += $analysis
+            }
+          }
+
+          # Export results
+          $results | Export-Csv -Path 'lint-results.csv' -NoTypeInformation
+
+          # Report
+          $errors = @($results | Where-Object Severity -eq 'Error')
+          $warnings = @($results | Where-Object Severity -eq 'Warning')
+
+          Write-Host "Results: $($errors.Count) errors, $($warnings.Count) warnings"
+
+          if ($errors.Count -gt 0) {
+            Write-Host "::error::PSScriptAnalyzer found $($errors.Count) error(s)"
+            foreach ($err in $errors) {
+              Write-Host "::error file=$($err.ScriptName),line=$($err.Line)::$($err.Message)"
+            }
+            exit 1
+          }
+
+          foreach ($warn in $warnings) {
+            Write-Host "::warning file=$($warn.ScriptName),line=$($warn.Line)::$($warn.Message)"
+          }
+
+      - name: Run PSScriptAnalyzer - Security Rules
+        shell: pwsh
+        run: |
+          $securityRules = @(
+            'PSAvoidUsingPlainTextForPassword',
+            'PSAvoidUsingConvertToSecureStringWithPlainText',
+            'PSAvoidUsingComputerNameHardcoded',
+            'PSUsePSCredentialType',
+            'PSAvoidUsingUserNameAndPasswordParams'
+          )
+
+          $files = Get-ChildItem -Path . -Include '*.ps1', '*.psm1' -Recurse |
+            Where-Object { $_.FullName -notmatch '[\\/](\.git|Tests)[\\/]' }
+
+          $securityIssues = @()
+          foreach ($file in $files) {
+            $results = Invoke-ScriptAnalyzer -Path $file.FullName -IncludeRule $securityRules
+            if ($results) {
+              $securityIssues += $results
+            }
+          }
+
+          # Check for hardcoded secrets patterns
+          $secretPatterns = @(
+            'api[_-]?key\s*=\s*["\x27][^\x27"]+["\x27]',
+            'password\s*=\s*["\x27][^\x27"]+["\x27]',
+            'secret\s*=\s*["\x27][^\x27"]+["\x27]',
+            'token\s*=\s*["\x27][^\x27"]+["\x27]'
+          )
+
+          foreach ($file in $files) {
+            $content = Get-Content $file.FullName -Raw -ErrorAction SilentlyContinue
+            foreach ($pattern in $secretPatterns) {
+              if ($content -match $pattern) {
+                Write-Host "::warning file=$($file.Name)::Potential hardcoded secret detected"
+              }
+            }
+          }
+
+          if ($securityIssues.Count -gt 0) {
+            $securityIssues | ConvertTo-Json -Depth 5 | Out-File 'security-report.json'
+            Write-Host "::warning::Found $($securityIssues.Count) security-related issues"
+          }
+
+      - name: Validate XAML (if present)
+        shell: pwsh
+        run: |
+          $guiFiles = Get-ChildItem -Path . -Include '*GUI*.ps1', '*Portable*.ps1' -Recurse
+
+          foreach ($file in $guiFiles) {
+            $content = Get-Content $file.FullName -Raw
+
+            # Extract embedded XAML
+            if ($content -match '\$xaml\s*=\s*@["\x27](.+?)[@"\x27]') {
+              Write-Host "Validating XAML in $($file.Name)..."
+              try {
+                Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
+                # Basic XML validation
+                $null = [xml]$Matches[1]
+                Write-Host "  XAML syntax valid"
+              } catch {
+                Write-Host "::error file=$($file.Name)::XAML validation failed: $_"
+              }
+            }
+          }
+
+      - name: Upload lint results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lint-results
+          path: |
+            lint-results.csv
+            security-report.json
+          retention-days: 7
+
+  # ============================================
+  # Job 2: Run Tests (Pester)
+  # ============================================
+  test:
+    name: Run Tests
+    runs-on: windows-latest
+    if: ${{ !inputs.skip_tests }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Pester
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module -Name Pester -MinimumVersion 5.0.0 -Force -Scope CurrentUser
+
+      - name: Run Pester Tests
+        id: pester
+        shell: pwsh
+        run: |
+          Import-Module Pester -MinimumVersion 5.0.0
+
+          $testFiles = Get-ChildItem -Path . -Filter '*.Tests.ps1' -Recurse
+
+          if ($testFiles.Count -eq 0) {
+            Write-Host "No test files found"
+            exit 0
+          }
+
+          Write-Host "Found $($testFiles.Count) test file(s)"
+
+          $config = New-PesterConfiguration
+          $config.Run.Path = $testFiles.FullName
+          $config.Run.Exit = $false
+          $config.Output.Verbosity = 'Detailed'
+          $config.TestResult.Enabled = $true
+          $config.TestResult.OutputPath = 'test-results.xml'
+          $config.TestResult.OutputFormat = 'NUnitXml'
+
+          # Code coverage (if modules exist)
+          $modules = Get-ChildItem -Path . -Filter '*.psm1' -Recurse |
+            Where-Object { $_.FullName -notmatch '[\\/]Tests[\\/]' }
+
+          if ($modules.Count -gt 0) {
+            $config.CodeCoverage.Enabled = $true
+            $config.CodeCoverage.Path = $modules.FullName
+            $config.CodeCoverage.OutputPath = 'coverage.xml'
+            $config.CodeCoverage.OutputFormat = 'JaCoCo'
+          }
+
+          $results = Invoke-Pester -Configuration $config
+
+          # Summary
+          Write-Host ""
+          Write-Host "Test Results:"
+          Write-Host "  Passed: $($results.PassedCount)"
+          Write-Host "  Failed: $($results.FailedCount)"
+          Write-Host "  Skipped: $($results.SkippedCount)"
+
+          if ($results.CodeCoverage) {
+            $coverage = [math]::Round($results.CodeCoverage.CoveragePercent, 2)
+            Write-Host "  Coverage: $coverage%"
+
+            if ($coverage -lt 50) {
+              Write-Host "::warning::Code coverage is below 50%"
+            }
+          }
+
+          if ($results.FailedCount -gt 0) {
+            Write-Host "::error::$($results.FailedCount) test(s) failed"
+            exit 1
+          }
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: |
+            test-results.xml
+            coverage.xml
+          retention-days: 7
+
+  # ============================================
+  # Job 3: Build Executable
+  # ============================================
+  build:
+    name: Build
+    runs-on: windows-latest
+    needs: [code-review, test]
+    if: always() && (needs.code-review.result == 'success') && (needs.test.result == 'success' || needs.test.result == 'skipped')
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET (if needed)
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.x'
+
+      - name: Install PS2EXE
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module -Name ps2exe -Force -Scope CurrentUser
+
+      - name: Determine Version
+        id: version
+        shell: pwsh
+        run: |
+          $version = '${{ inputs.version }}'
+          if ([string]::IsNullOrEmpty($version)) {
+            $version = Get-Date -Format 'yyyy.MM.dd'
+            $version = "$version.${{ github.run_number }}"
+          }
+          Write-Host "Version: $version"
+          echo "VERSION=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Build Executable
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.VERSION }}'
+
+          # Find main GUI script
+          $guiScript = Get-ChildItem -Path . -Include '*Portable*.ps1', '*GUI*.ps1' -Recurse |
+            Where-Object { $_.FullName -match 'src[\\/]GUI' } |
+            Select-Object -First 1
+
+          if (-not $guiScript) {
+            Write-Host "No GUI script found, skipping EXE build"
+            exit 0
+          }
+
+          Write-Host "Building from: $($guiScript.FullName)"
+
+          # Find icon
+          $icon = Get-ChildItem -Path . -Filter '*.ico' -Recurse | Select-Object -First 1
+
+          $params = @{
+            InputFile = $guiScript.FullName
+            OutputFile = ".\dist\GA-TemplateApp.exe"
+            Version = $version
+            NoConsole = $true
+            RequireAdmin = $true
+            x64 = $true
+          }
+
+          if ($icon) {
+            $params.IconFile = $icon.FullName
+          }
+
+          # Ensure dist folder exists
+          New-Item -Path '.\dist' -ItemType Directory -Force | Out-Null
+
+          Invoke-ps2exe @params
+
+          Write-Host "Build complete: .\dist\GA-TemplateApp.exe"
+
+      - name: Validate EXE and Benchmark Startup
+        id: benchmark
+        shell: pwsh
+        run: |
+          $exePath = ".\dist\GA-TemplateApp.exe"
+
+          if (-not (Test-Path $exePath)) {
+            Write-Host "EXE not found, skipping validation"
+            exit 0
+          }
+
+          # Check EXE size
+          $exe = Get-Item $exePath
+          $sizeMB = [math]::Round($exe.Length / 1MB, 2)
+          Write-Host "EXE Size: $sizeMB MB"
+
+          if ($sizeMB -gt 50) {
+            Write-Host "::warning::EXE size ($sizeMB MB) exceeds 50 MB threshold"
+          }
+
+          # Benchmark startup time
+          Write-Host "Benchmarking startup time..."
+          $maxStartupMs = 5000
+
+          $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+          $process = Start-Process -FilePath $exePath -PassThru -WindowStyle Hidden
+
+          # Wait for window or timeout
+          $timeout = $maxStartupMs
+          while (-not $process.MainWindowHandle -and $stopwatch.ElapsedMilliseconds -lt $timeout) {
+            Start-Sleep -Milliseconds 100
+            $process.Refresh()
+          }
+          $stopwatch.Stop()
+
+          $startupTimeMs = $stopwatch.ElapsedMilliseconds
+          Write-Host "Startup Time: ${startupTimeMs}ms"
+
+          # Check if crashed
+          $crashed = $process.HasExited -and $process.ExitCode -ne 0
+
+          # Cleanup
+          if (-not $process.HasExited) {
+            $process | Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+
+          if ($crashed) {
+            Write-Host "::error::EXE crashed on launch with exit code $($process.ExitCode)"
+            exit 1
+          }
+
+          if ($startupTimeMs -gt $maxStartupMs) {
+            Write-Host "::warning::Startup time (${startupTimeMs}ms) exceeds ${maxStartupMs}ms threshold"
+          }
+
+          # Output metrics for tracking
+          echo "EXE_SIZE_MB=$sizeMB" >> $env:GITHUB_OUTPUT
+          echo "STARTUP_TIME_MS=$startupTimeMs" >> $env:GITHUB_OUTPUT
+
+          Write-Host ""
+          Write-Host "Build Metrics:"
+          Write-Host "  - EXE Size: $sizeMB MB"
+          Write-Host "  - Startup Time: ${startupTimeMs}ms"
+          Write-Host "  - Status: OK"
+
+      - name: Create Distribution Package
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.VERSION }}'
+          $packageName = "GA-TemplateApp-v$version"
+          $stagingPath = ".\staging\$packageName"
+
+          # Create staging directory
+          New-Item -Path $stagingPath -ItemType Directory -Force | Out-Null
+
+          # Copy files
+          $filesToCopy = @(
+            @{ Source = '.\dist\GA-TemplateApp.exe'; Required = $false },
+            @{ Source = '.\README.md'; Required = $true },
+            @{ Source = '.\CHANGELOG.md'; Required = $false },
+            @{ Source = '.\LICENSE'; Required = $false }
+          )
+
+          foreach ($file in $filesToCopy) {
+            if (Test-Path $file.Source) {
+              Copy-Item $file.Source -Destination $stagingPath
+            } elseif ($file.Required) {
+              Write-Host "::warning::Required file not found: $($file.Source)"
+            }
+          }
+
+          # Copy directories if they exist
+          @('config', 'assets', 'docs') | ForEach-Object {
+            if (Test-Path ".\$_") {
+              Copy-Item ".\$_" -Destination $stagingPath -Recurse
+            }
+          }
+
+          # Create ZIP
+          $zipPath = ".\dist\$packageName.zip"
+          Compress-Archive -Path $stagingPath -DestinationPath $zipPath -Force
+
+          Write-Host "Package created: $zipPath"
+
+          # Cleanup staging
+          Remove-Item -Path '.\staging' -Recurse -Force
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: dist/
+          retention-days: 30
+
+  # ============================================
+  # Job 4: Create Release (Manual Only)
+  # ============================================
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: ${{ inputs.create_release == true }}
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts
+          path: dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ inputs.version || 'latest' }}
+          name: GA-TemplateApp v${{ inputs.version || 'latest' }}
+          draft: true
+          generate_release_notes: true
+          files: dist/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
